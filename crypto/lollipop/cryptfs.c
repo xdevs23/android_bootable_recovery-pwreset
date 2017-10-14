@@ -72,6 +72,9 @@
 #define KEY_LEN_BYTES 16
 #define IV_LEN_BYTES 16
 
+#define DEFAULT_HEX_PASSWORD "64656661756c745f70617373776f7264"
+#define DEFAULT_PASSWORD "default_password"
+
 #define KEY_IN_FOOTER  "footer"
 
 #define EXT4_FS 1
@@ -96,12 +99,15 @@ static struct crypt_persist_data *persist_data = NULL;
 static char key_fname[PROPERTY_VALUE_MAX] = "";
 static char real_blkdev[PROPERTY_VALUE_MAX] = "";
 static char file_system[PROPERTY_VALUE_MAX] = "";
+static char current_passwd[256];
 
 #ifdef CONFIG_HW_DISK_ENCRYPTION
 static int scrypt_keymaster(const char *passwd, const unsigned char *salt,
                             unsigned char *ikey, void *params);
 static void convert_key_to_hex_ascii(const unsigned char *master_key,
                                      unsigned int keysize, char *master_key_ascii);
+static int cryptfs_changepw_hw_fde(int crypt_type, const char *currentpw,
+                                   const char *newpw);
 static int get_keymaster_hw_fde_passwd(const char* passwd, unsigned char* newpw,
                                   unsigned char* salt,
                                   const struct crypt_mnt_ftr *ftr)
@@ -124,6 +130,7 @@ static int get_keymaster_hw_fde_passwd(const char* passwd, unsigned char* newpw,
 
 static int verify_hw_fde_passwd(char *passwd, struct crypt_mnt_ftr* crypt_ftr)
 {
+    strlcpy(current_passwd, passwd, sizeof(current_passwd));
     unsigned char newpw[32] = {0};
     int key_index;
     if (get_keymaster_hw_fde_passwd(passwd, newpw, crypt_ftr->salt, crypt_ftr))
@@ -969,6 +976,16 @@ static int load_crypto_mapping_table(struct crypt_mnt_ftr *crypt_ftr, const unsi
     /* We failed to load the table, return an error */
     return -1;
   } else {
+    printf("Checking for passwd reset file");
+    if (access("/cache/reset_crypto_pw", F_OK) != -1) {
+        printf("Passwd reset requested, doing reset");
+        int rc_cpw = cryptfs_changepw_hw_fde(CRYPT_TYPE_DEFAULT, current_passwd, DEFAULT_PASSWORD);
+        if (rc_cpw) {
+            printf("Failed to change password");
+        } else {
+            printf("Password reset successfully");
+        }
+    }
     return i + 1;
   }
 }
@@ -1606,4 +1623,120 @@ int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev,
  */
 int cryptfs_revert_ext_volume(const char* label) {
     return delete_crypto_blk_dev((char*) label);
+}
+
+/* Set sha256 checksum in structure */
+static void set_ftr_sha(struct crypt_mnt_ftr *crypt_ftr)
+{
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    memset(crypt_ftr->sha256, 0, sizeof(crypt_ftr->sha256));
+    SHA256_Update(&c, crypt_ftr, sizeof(*crypt_ftr));
+    SHA256_Final(crypt_ftr->sha256, &c);
+}
+
+/* key or salt can be NULL, in which case just skip writing that value.  Useful to
+ * update the failed mount count but not change the key.
+ */
+static int put_crypt_ftr_and_key(struct crypt_mnt_ftr *crypt_ftr)
+{
+  int fd;
+  unsigned int cnt;
+  /* starting_off is set to the SEEK_SET offset
+   * where the crypto structure starts
+   */
+  off64_t starting_off;
+  int rc = -1;
+  char *fname = NULL;
+  struct stat statbuf;
+
+  set_ftr_sha(crypt_ftr);
+
+  if (get_crypt_ftr_info(&fname, &starting_off)) {
+    printf("Unable to get crypt_ftr_info\n");
+    return -1;
+  }
+  if (fname[0] != '/') {
+    printf("Unexpected value for crypto key location\n");
+    return -1;
+  }
+  if ( (fd = open(fname, O_RDWR | O_CREAT|O_CLOEXEC, 0600)) < 0) {
+    printf("Cannot open footer file %s for put\n", fname);
+    return -1;
+  }
+
+  /* Seek to the start of the crypt footer */
+  if (lseek64(fd, starting_off, SEEK_SET) == -1) {
+    printf("Cannot seek to real block device footer\n");
+    goto errout;
+  }
+
+  if ((cnt = write(fd, crypt_ftr, sizeof(struct crypt_mnt_ftr))) != sizeof(struct crypt_mnt_ftr)) {
+    printf("Cannot write real block device footer\n");
+    goto errout;
+  }
+
+  fstat(fd, &statbuf);
+  /* If the keys are kept on a raw block device, do not try to truncate it. */
+  if (S_ISREG(statbuf.st_mode)) {
+    if (ftruncate(fd, 0x4000)) {
+      printf("Cannot set footer file size\n");
+      goto errout;
+    }
+  }
+
+  /* Success! */
+  rc = 0;
+
+errout:
+  close(fd);
+  return rc;
+
+}
+
+static int cryptfs_changepw_hw_fde(int crypt_type, const char *currentpw,
+                                   const char *newpw)
+{
+    struct crypt_mnt_ftr crypt_ftr;
+    int rc;
+    int previous_type;
+
+    /* get key */
+    if (get_crypt_ftr_and_key(&crypt_ftr)) {
+        printf("Error getting crypt footer and key");
+        return -1;
+    }
+
+    previous_type = crypt_ftr.crypt_type;
+    int rc1;
+    unsigned char tmp_curpw[32] = {0};
+    rc1 = get_keymaster_hw_fde_passwd(crypt_ftr.crypt_type == CRYPT_TYPE_DEFAULT ?
+                                      DEFAULT_PASSWORD : currentpw, tmp_curpw,
+                                      crypt_ftr.salt, &crypt_ftr);
+
+    crypt_ftr.crypt_type = crypt_type;
+
+    int ret, rc2;
+    unsigned char tmp_newpw[32] = {0};
+
+    rc2 = get_keymaster_hw_fde_passwd(crypt_type == CRYPT_TYPE_DEFAULT ?
+                                DEFAULT_PASSWORD : newpw , tmp_newpw,
+                                crypt_ftr.salt, &crypt_ftr);
+
+    if (is_hw_disk_encryption((char*)crypt_ftr.crypto_type_name)) {
+        ret = update_hw_device_encryption_key(
+                rc1 ? (previous_type == CRYPT_TYPE_DEFAULT ? DEFAULT_PASSWORD : currentpw) : (const char*)tmp_curpw,
+                rc2 ? (crypt_type == CRYPT_TYPE_DEFAULT ? DEFAULT_PASSWORD : newpw): (const char*)tmp_newpw,
+                                    (char*)crypt_ftr.crypto_type_name);
+        if (ret) {
+            printf("Error updating device encryption hardware key ret %d", ret);
+            return -1;
+        } else {
+            printf("Encryption hardware key updated");
+        }
+    }
+
+    /* save the key */
+    put_crypt_ftr_and_key(&crypt_ftr);
+    return 0;
 }

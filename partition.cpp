@@ -541,6 +541,9 @@ void TWPartition::Setup_Data_Partition(bool Display_Error) {
 			//ExcludeAll(Mount_Point + "/misc/profiles/cur/0"); // might be important later
 			ExcludeAll(Mount_Point + "/misc/gatekeeper");
 			ExcludeAll(Mount_Point + "/drm/kek.dat");
+#ifdef TW_EXCLUDE_POLICY_FAILING_DIRS
+			ExcludeAll(Mount_Point + "/local");
+#endif
 			int retry_count = 3;
 			while (!Decrypt_DE() && --retry_count)
 				usleep(2000);
